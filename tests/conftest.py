@@ -40,6 +40,8 @@ def _clean_tables():
     import app.models as models
     db = SessionLocal()
     try:
+        db.query(models.LoadingScheduleItem).delete()
+        db.query(models.LoadingSchedule).delete()
         db.query(models.ConfirmedSlot).delete()
         db.query(models.PlanItem).delete()
         db.query(models.Plan).delete()

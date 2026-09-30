@@ -161,6 +161,62 @@ class PlanConfirmIn(BaseModel):
     manifest_revision: int = Field(..., description="确认时核对的箱清单修订号")
 
 
+# ---------- 装船时间表 ----------
+
+
+class ScheduleEntryIn(BaseModel):
+    no: str = Field(..., description="箱号（须与方案箱项一致）")
+    duration: int = Field(..., gt=0, description="该箱吊装时长（正整数分钟）")
+    release_minute: int = Field(..., ge=0, description="最早开工分钟（非负整数）")
+    deadline_minute: int = Field(..., ge=0, description="最迟完工分钟（非负整数，可恰在此时刻结束）")
+
+    @field_validator("no")
+    @classmethod
+    def _no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "箱号")
+
+    @model_validator(mode="after")
+    def _window(self) -> "ScheduleEntryIn":
+        if self.release_minute > self.deadline_minute:
+            raise ValueError(
+                f"箱 {self.no} 的最早开工 {self.release_minute} 不得晚于最迟完工 "
+                f"{self.deadline_minute}（时间窗倒置）"
+            )
+        return self
+
+
+class ScheduleCreateIn(BaseModel):
+    crane_count: int = Field(..., gt=0, description="岸桥数量（正整数）")
+    entries: list[ScheduleEntryIn] = Field(..., description="每箱的吊装时长与时间窗，方案为空箱时传空列表")
+
+    @model_validator(mode="after")
+    def _unique(self) -> "ScheduleCreateIn":
+        nos = [e.no for e in self.entries]
+        if len(set(nos)) != len(nos):
+            dup = sorted({n for n in nos if nos.count(n) > 1})
+            raise ValueError(f"提交箱号重复：{', '.join(dup)}")
+        return self
+
+
+class ScheduleEntryOut(BaseModel):
+    container_no: str
+    start_minute: int
+    finish_minute: int
+    crane_no: int
+    stack: str
+    tier: int
+
+
+class ScheduleOut(BaseModel):
+    plan_id: str
+    revision_no: int
+    status: str = Field(..., description="current=当前排程；historical=方案修订已被取代")
+    crane_count: int
+    makespan: int
+    entries: list[ScheduleEntryOut]
+    created_at: str
+
+
 class AssignmentOut(BaseModel):
     container_no: str
     slot_code: str

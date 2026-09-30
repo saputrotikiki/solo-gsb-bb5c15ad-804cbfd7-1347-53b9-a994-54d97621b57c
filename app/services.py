@@ -8,7 +8,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import models
-from app.schemas import ManifestIn, PlanConfirmIn, SlotDataIn
+from app.schemas import ManifestIn, PlanConfirmIn, ScheduleCreateIn, SlotDataIn
+from app.scheduler import InfeasibleSchedule, Job, solve_loading
 from app.solver import (
     Container,
     InfeasibleStowage,
@@ -307,6 +308,12 @@ def confirm_plan(
             cursor.execute(
                 "UPDATE plans SET status = 'superseded' WHERE id = ?", (old_id,)
             )
+            # 旧修订的装船排程保留可查，但不再列为当前排程
+            cursor.execute(
+                "UPDATE loading_schedules SET status = 'historical' "
+                "WHERE plan_id = ? AND status = 'current'",
+                (old_id,),
+            )
 
         # 冲突预检：本方案占用槽位是否已被其他方案的确认占用
         conflict_slot = None
@@ -353,6 +360,152 @@ def _latest_slot_revision(db: Session) -> int:
 
 def _latest_manifest_revision(db: Session) -> int:
     return db.scalar(select(func.max(models.ManifestRevision.revision))) or 0
+
+
+# ---------- 装船时间表 ----------
+
+
+def create_loading_schedule(
+    db: Session,
+    plan_id: str,
+    payload: ScheduleCreateIn,
+) -> models.LoadingSchedule:
+    """为已确认方案修订求解并保存装船时间表。
+
+    箱项缺失或多余、时间窗无解、求解不可行均拒绝且不保存；
+    保存前在 IMMEDIATE 写锁内再次核对方案仍为已确认状态。
+    """
+    plan = get_plan(db, plan_id)
+    if plan.status != "confirmed":
+        raise ConflictError(
+            f"方案当前状态为 {plan.status}，仅已确认方案可生成装船时间表"
+        )
+
+    # 箱项必须与方案修订完全一致（不多不少）
+    plan_items = {i.container_no: i for i in plan.items}
+    submitted = {e.no: e for e in payload.entries}
+    missing = sorted(set(plan_items) - set(submitted))
+    extra = sorted(set(submitted) - set(plan_items))
+    if missing or extra:
+        problems = []
+        if missing:
+            problems.append(f"缺少箱项：{', '.join(missing)}")
+        if extra:
+            problems.append(f"多余箱项：{', '.join(extra)}")
+        raise BusinessError(
+            "提交箱项与方案修订不一致（" + "；".join(problems) + "），拒绝排程",
+            422,
+        )
+
+    jobs = [
+        Job(
+            no=no,
+            stack=plan_items[no].stack,
+            stack_tier=plan_items[no].tier,
+            duration=e.duration,
+            release=e.release_minute,
+            deadline=e.deadline_minute,
+        )
+        for no, e in submitted.items()
+    ]
+    try:
+        result = solve_loading(jobs, payload.crane_count)
+    except InfeasibleSchedule as exc:
+        raise BusinessError(f"无解：{exc.reason}", 422)
+
+    # 求解完成后快照结果，结束只读事务；在独立连接的写锁内复核方案状态后落库
+    snapshot = tuple(
+        (
+            sc.container_no,
+            plan_items[sc.container_no].stack,
+            plan_items[sc.container_no].tier,
+            sc.start_minute,
+            sc.finish_minute,
+            sc.crane_no,
+        )
+        for sc in result.jobs
+    )
+    crane_count = payload.crane_count
+    makespan = result.makespan
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            "SELECT status FROM plans WHERE id = ?", (plan_id,)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            raise ConflictError("方案在排程保存期间被删除，排程被拒绝且不保存")
+        if row[0] != "confirmed":
+            conn.rollback()
+            raise ConflictError(
+                f"保存前复核发现方案状态已为 {row[0]}（方案可能已被新修订取代），"
+                "本次排程被拒绝且不保存"
+            )
+
+        # 同一方案修订重新提交：以新排程原子替换旧排程
+        cursor.execute(
+            "SELECT id FROM loading_schedules WHERE plan_id = ?", (plan_id,)
+        )
+        old = cursor.fetchone()
+        if old is not None:
+            cursor.execute(
+                "DELETE FROM loading_schedule_items WHERE schedule_id = ?",
+                (old[0],),
+            )
+            cursor.execute("DELETE FROM loading_schedules WHERE id = ?", (old[0],))
+
+        now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+        cursor.execute(
+            "INSERT INTO loading_schedules "
+            "(plan_id, crane_count, makespan, status, created_at) "
+            "VALUES (?, ?, ?, 'current', ?)",
+            (plan_id, crane_count, makespan, now),
+        )
+        schedule_id = cursor.lastrowid
+        cursor.executemany(
+            "INSERT INTO loading_schedule_items "
+            "(schedule_id, container_no, stack, tier, start_minute, "
+            "finish_minute, crane_no) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(schedule_id, *row7) for row7 in snapshot],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    return get_loading_schedule(db, plan_id)
+
+
+def list_loading_schedules(
+    db: Session, include_historical: bool = False
+) -> list[models.LoadingSchedule]:
+    stmt = select(models.LoadingSchedule)
+    if not include_historical:
+        stmt = stmt.where(models.LoadingSchedule.status == "current")
+    stmt = stmt.order_by(models.LoadingSchedule.id)
+    return list(db.scalars(stmt))
+
+
+def get_loading_schedule(db: Session, plan_id: str) -> models.LoadingSchedule:
+    schedule = db.scalar(
+        select(models.LoadingSchedule).where(
+            models.LoadingSchedule.plan_id == plan_id
+        )
+    )
+    if schedule is None:
+        raise BusinessError(f"方案 {plan_id} 不存在装船时间表", 404)
+    return schedule
 
 
 def utc_iso(dt) -> str | None:

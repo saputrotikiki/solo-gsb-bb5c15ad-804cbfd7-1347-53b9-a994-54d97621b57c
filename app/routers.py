@@ -16,6 +16,9 @@ from app.schemas import (
     PlanComputeIn,
     PlanConfirmIn,
     PlanOut,
+    ScheduleCreateIn,
+    ScheduleEntryOut,
+    ScheduleOut,
     SlotDataIn,
     SlotRevisionOut,
 )
@@ -179,3 +182,65 @@ def list_plans(db: Session = Depends(get_db)):
 )
 def get_plan(plan_id: str, db: Session = Depends(get_db)):
     return _plan_out(services.get_plan(db, plan_id))
+
+
+# ---------- 装船时间表 ----------
+
+
+def _schedule_out(s) -> ScheduleOut:
+    return ScheduleOut(
+        plan_id=s.plan_id,
+        revision_no=s.plan.revision_no,
+        status=s.status,
+        crane_count=s.crane_count,
+        makespan=s.makespan,
+        entries=[
+            ScheduleEntryOut(
+                container_no=i.container_no,
+                start_minute=i.start_minute,
+                finish_minute=i.finish_minute,
+                crane_no=i.crane_no,
+                stack=i.stack,
+                tier=i.tier,
+            )
+            for i in sorted(s.items, key=lambda x: x.container_no)
+        ],
+        created_at=services.utc_iso(s.created_at),
+    )
+
+
+@router.post(
+    "/plans/{plan_id}/schedules",
+    response_model=ScheduleOut,
+    status_code=201,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="为已确认方案修订生成装船时间表（先最短总体完工，再按箱号字典序最小）",
+)
+def create_loading_schedule(
+    plan_id: str, body: ScheduleCreateIn, db: Session = Depends(get_db)
+):
+    schedule = services.create_loading_schedule(db, plan_id, body)
+    return _schedule_out(schedule)
+
+
+@router.get(
+    "/schedules",
+    response_model=list[ScheduleOut],
+    summary="列出装船时间表（默认仅当前排程；historical=true 含历史排程）",
+)
+def list_loading_schedules(
+    historical: bool = False, db: Session = Depends(get_db)
+):
+    schedules = services.list_loading_schedules(db, include_historical=historical)
+    return [_schedule_out(s) for s in schedules]
+
+
+@router.get(
+    "/plans/{plan_id}/schedules",
+    response_model=ScheduleOut,
+    responses={404: {"model": MessageOut}},
+    summary="查询某方案修订绑定的装船时间表（历史排程可查，含 status）",
+)
+def get_loading_schedule(plan_id: str, db: Session = Depends(get_db)):
+    return _schedule_out(services.get_loading_schedule(db, plan_id))

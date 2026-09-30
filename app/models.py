@@ -210,3 +210,60 @@ class ConfirmedSlot(Base):
     __table_args__ = (
         UniqueConstraint("slot_code", name="uq_confirmed_slot"),
     )
+
+
+class LoadingSchedule(Base):
+    """绑定某个方案修订的装船时间表。
+
+    只允许对已确认方案保存；方案修订被新修订取代（superseded）后，
+    其排程仍可查询但状态转为 historical，不再列为当前排程。
+    """
+
+    __tablename__ = "loading_schedules"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    crane_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    makespan: Mapped[int] = mapped_column(Integer, nullable=False)
+    # current=绑定方案仍为当前已确认修订；historical=方案修订已被取代
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="current")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    items: Mapped[list["LoadingScheduleItem"]] = relationship(
+        back_populates="schedule", cascade="all, delete-orphan"
+    )
+    plan: Mapped[Plan] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("crane_count > 0", name="ck_schedule_cranes"),
+        CheckConstraint("makespan >= 0", name="ck_schedule_makespan"),
+        CheckConstraint(
+            "status IN ('current', 'historical')", name="ck_schedule_status"
+        ),
+    )
+
+
+class LoadingScheduleItem(Base):
+    """装船时间表中单箱安排：开工/完工分钟与岸桥编号（自 1 起）。"""
+
+    __tablename__ = "loading_schedule_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    schedule_id: Mapped[int] = mapped_column(
+        ForeignKey("loading_schedules.id", ondelete="CASCADE"), index=True
+    )
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    stack: Mapped[str] = mapped_column(String(64), nullable=False)
+    tier: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    finish_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    crane_no: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    schedule: Mapped[LoadingSchedule] = relationship(back_populates="items")
+
+    __table_args__ = (
+        UniqueConstraint("schedule_id", "container_no",
+                         name="uq_schedule_item_container"),
+    )
