@@ -16,6 +16,9 @@ from app.schemas import (
     PlanComputeIn,
     PlanConfirmIn,
     PlanOut,
+    ScheduleCreateIn,
+    ScheduleItemOut,
+    ScheduleOut,
     SlotDataIn,
     SlotRevisionOut,
 )
@@ -179,3 +182,78 @@ def list_plans(db: Session = Depends(get_db)):
 )
 def get_plan(plan_id: str, db: Session = Depends(get_db)):
     return _plan_out(services.get_plan(db, plan_id))
+
+
+# ---------- 装船排程 ----------
+
+
+def _schedule_out(s) -> ScheduleOut:
+    return ScheduleOut(
+        schedule_id=s.id,
+        plan_id=s.plan_id,
+        status=s.status,
+        cranes=s.cranes,
+        makespan=s.makespan,
+        root_id=s.root_id,
+        plan_revision_no=s.plan_revision_no,
+        slots_revision=s.slots_revision,
+        manifest_revision=s.manifest_revision,
+        tasks=[
+            ScheduleItemOut(
+                container_no=i.container_no,
+                stack=i.stack,
+                tier=i.tier,
+                start=i.start_min,
+                finish=i.finish_min,
+                crane=i.crane_no,
+            )
+            for i in sorted(s.items, key=lambda x: x.container_no)
+        ],
+        created_at=services.utc_iso(s.created_at),
+    )
+
+
+@router.post(
+    "/plans/{plan_id}/schedules",
+    response_model=ScheduleOut,
+    status_code=201,
+    responses={
+        404: {"model": MessageOut},
+        409: {"model": MessageOut},
+        422: {"model": MessageOut},
+    },
+    summary="为已确认方案修订编排装船排程（求解并保存）",
+)
+def create_schedule(plan_id: str, body: ScheduleCreateIn, db: Session = Depends(get_db)):
+    sched = services.create_schedule(db, plan_id, body)
+    return _schedule_out(sched)
+
+
+@router.get(
+    "/schedules",
+    response_model=list[ScheduleOut],
+    summary="列出排程（可按 plan_id / status=current,superseded 过滤）",
+)
+def list_schedules(
+    plan_id: str | None = None,
+    status: str | None = None,
+    db: Session = Depends(get_db),
+):
+    if status is not None and status not in ("current", "superseded"):
+        raise services.BusinessError(
+            "status 仅支持 current 或 superseded", 400
+        )
+    return [
+        _schedule_out(s)
+        for s in services.list_schedules(db, plan_id=plan_id, status=status)
+    ]
+
+
+@router.get(
+    "/schedules/{schedule_id}",
+    response_model=ScheduleOut,
+    responses={404: {"model": MessageOut}},
+    summary="查询单个排程（历史排程可查，含 status 标记）",
+)
+def get_schedule(schedule_id: str, db: Session = Depends(get_db)):
+    return _schedule_out(services.get_schedule(db, schedule_id))

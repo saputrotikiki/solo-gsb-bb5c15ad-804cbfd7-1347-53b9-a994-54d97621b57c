@@ -210,3 +210,64 @@ class ConfirmedSlot(Base):
     __table_args__ = (
         UniqueConstraint("slot_code", name="uq_confirmed_slot"),
     )
+
+
+class Schedule(Base):
+    """装船排程，绑定某个具体方案修订（plan_id）。
+
+    status: current=当前排程；superseded=历史排程（被同方案修订的新排程
+    取代，或所绑定方案修订被新修订取代）。
+    """
+
+    __tablename__ = "schedules"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_new_id)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="current")
+    cranes: Mapped[int] = mapped_column(Integer, nullable=False)
+    makespan: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 绑定快照：方案修订链与资料修订，便于排程脱离方案独立展示
+    root_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    plan_revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    slots_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    manifest_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    items: Mapped[list["ScheduleItem"]] = relationship(
+        back_populates="schedule", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_schedules_plan", "plan_id"),
+        Index("ix_schedules_root", "root_id"),
+        Index("ix_schedules_status", "status"),
+        CheckConstraint(
+            "status IN ('current', 'superseded')", name="ck_schedule_status"
+        ),
+        CheckConstraint("cranes > 0", name="ck_schedule_cranes_pos"),
+    )
+
+
+class ScheduleItem(Base):
+    """排程中的单箱作业：开工/完工分钟与岸桥编号。"""
+
+    __tablename__ = "schedule_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    schedule_id: Mapped[str] = mapped_column(
+        ForeignKey("schedules.id", ondelete="CASCADE"), index=True
+    )
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    stack: Mapped[str] = mapped_column(String(64), nullable=False)
+    tier: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_min: Mapped[int] = mapped_column(Integer, nullable=False)
+    finish_min: Mapped[int] = mapped_column(Integer, nullable=False)
+    crane_no: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    schedule: Mapped[Schedule] = relationship(back_populates="items")
+
+    __table_args__ = (
+        UniqueConstraint("schedule_id", "container_no", name="uq_sched_container"),
+    )

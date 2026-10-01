@@ -41,6 +41,8 @@ def _clean_tables():
     db = SessionLocal()
     try:
         db.query(models.ConfirmedSlot).delete()
+        db.query(models.ScheduleItem).delete()
+        db.query(models.Schedule).delete()
         db.query(models.PlanItem).delete()
         db.query(models.Plan).delete()
         db.query(models.ContainerRow).delete()

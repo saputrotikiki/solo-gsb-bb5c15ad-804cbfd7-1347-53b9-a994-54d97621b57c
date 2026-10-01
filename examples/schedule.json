@@ -1,0 +1,9 @@
+{
+  "cranes": 2,
+  "tasks": [
+    {"no": "C001", "duration": 3, "earliest_start": 0, "latest_finish": 60},
+    {"no": "C002", "duration": 4, "earliest_start": 0, "latest_finish": 60},
+    {"no": "C003", "duration": 2, "earliest_start": 10, "latest_finish": 60},
+    {"no": "C004", "duration": 5, "earliest_start": 0, "latest_finish": 60}
+  ]
+}

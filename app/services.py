@@ -8,7 +8,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import models
-from app.schemas import ManifestIn, PlanConfirmIn, SlotDataIn
+from app.scheduler import InfeasibleSchedule, Task, solve_schedule
+from app.schemas import ManifestIn, PlanConfirmIn, ScheduleCreateIn, SlotDataIn
 from app.solver import (
     Container,
     InfeasibleStowage,
@@ -307,6 +308,12 @@ def confirm_plan(
             cursor.execute(
                 "UPDATE plans SET status = 'superseded' WHERE id = ?", (old_id,)
             )
+            # 被取代方案修订上的排程一并转为历史（旧排程仍可按 ID 查询）
+            cursor.execute(
+                "UPDATE schedules SET status = 'superseded' "
+                "WHERE plan_id = ? AND status = 'current'",
+                (old_id,),
+            )
 
         # 冲突预检：本方案占用槽位是否已被其他方案的确认占用
         conflict_slot = None
@@ -361,3 +368,149 @@ def utc_iso(dt) -> str | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc).isoformat()
     return dt.astimezone(timezone.utc).isoformat()
+
+
+# ---------- 装船排程 ----------
+
+
+def list_schedules(
+    db: Session,
+    plan_id: str | None = None,
+    status: str | None = None,
+) -> list[models.Schedule]:
+    stmt = select(models.Schedule).order_by(
+        models.Schedule.created_at, models.Schedule.id
+    )
+    if plan_id is not None:
+        stmt = stmt.where(models.Schedule.plan_id == plan_id)
+    if status is not None:
+        stmt = stmt.where(models.Schedule.status == status)
+    return list(db.scalars(stmt))
+
+
+def get_schedule(db: Session, schedule_id: str) -> models.Schedule:
+    sched = db.get(models.Schedule, schedule_id)
+    if sched is None:
+        raise BusinessError(f"排程 {schedule_id} 不存在", 404)
+    return sched
+
+
+def create_schedule(
+    db: Session,
+    plan_id: str,
+    payload: ScheduleCreateIn,
+) -> models.Schedule:
+    plan = get_plan(db, plan_id)
+    if plan.status != "confirmed":
+        if plan.status == "draft":
+            raise ConflictError("方案尚未确认，不能编排装船排程（请先确认方案）")
+        raise ConflictError("方案修订已被取代（superseded），不能为其编排排程")
+
+    # 箱项必须与方案完全一致：不缺、不多
+    plan_nos = {i.container_no for i in plan.items}
+    payload_nos = {t.no for t in payload.tasks}
+    missing = sorted(plan_nos - payload_nos)
+    extra = sorted(payload_nos - plan_nos)
+    if missing or extra:
+        problems = []
+        if missing:
+            problems.append(f"缺少箱项：{', '.join(missing)}")
+        if extra:
+            problems.append(f"多余箱项：{', '.join(extra)}")
+        raise BusinessError("排程箱项与方案不一致（" + "；".join(problems) + "）", 422)
+
+    item_by_no = {i.container_no: i for i in plan.items}
+    tasks = [
+        Task(
+            no=t.no,
+            stack=item_by_no[t.no].stack,
+            tier=item_by_no[t.no].tier,
+            duration=t.duration,
+            earliest=t.earliest_start,
+            latest=t.latest_finish,
+        )
+        for t in payload.tasks
+    ]
+    # 箱号 -> (堆栈, 层) 纯数据快照（rollback 后 ORM 属性会过期）
+    pos_snapshot = {no: (it.stack, it.tier) for no, it in item_by_no.items()}
+    plan_id_snapshot = plan.id
+
+    # 空箱方案：空排程、总体完工时间 0（岸桥数仍须为正）
+    if not tasks:
+        result = solve_schedule([], payload.cranes)
+    else:
+        try:
+            result = solve_schedule(tasks, payload.cranes)
+        except InfeasibleSchedule as exc:
+            raise BusinessError(f"时间窗无解：{exc.reason}", 422)
+
+    # 求解可能耗时；落库前释放 ORM 隐式事务，在独立连接上以
+    # BEGIN IMMEDIATE 串行化，并在锁内再次核对方案仍已确认。
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    new_id = models._new_id()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+
+        cursor.execute(
+            "SELECT status, revision_no, root_id, slots_revision, manifest_revision "
+            "FROM plans WHERE id = ?",
+            (plan_id_snapshot,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            raise ConflictError("方案在排程保存期间被删除，排程被拒绝且不保存")
+        status_locked, rev_no_locked, root_locked, slots_rev, manifest_rev = row
+        if status_locked != "confirmed":
+            conn.rollback()
+            raise ConflictError(
+                f"保存前复核发现方案已不再是已确认状态（当前：{status_locked}），"
+                "排程被拒绝且不保存"
+            )
+
+        # 同一方案修订重新提交：旧排程转为历史
+        cursor.execute(
+            "UPDATE schedules SET status = 'superseded' "
+            "WHERE plan_id = ? AND status = 'current'",
+            (plan_id_snapshot,),
+        )
+
+        now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+        cursor.execute(
+            "INSERT INTO schedules "
+            "(id, plan_id, status, cranes, makespan, root_id, plan_revision_no, "
+            " slots_revision, manifest_revision, created_at) "
+            "VALUES (?, ?, 'current', ?, ?, ?, ?, ?, ?, ?)",
+            (
+                new_id, plan_id_snapshot, payload.cranes, result.makespan,
+                root_locked, rev_no_locked, slots_rev, manifest_rev, now,
+            ),
+        )
+        cursor.executemany(
+            "INSERT INTO schedule_items "
+            "(schedule_id, container_no, stack, tier, start_min, finish_min, crane_no) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    new_id, t.no,
+                    pos_snapshot[t.no][0], pos_snapshot[t.no][1],
+                    t.start, t.finish, t.crane,
+                )
+                for t in result.tasks
+            ],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    return get_schedule(db, new_id)

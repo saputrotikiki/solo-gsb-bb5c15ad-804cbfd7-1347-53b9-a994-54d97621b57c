@@ -199,3 +199,65 @@ class ManifestRevisionOut(BaseModel):
 
 class MessageOut(BaseModel):
     detail: str
+
+
+# ---------- 装船排程 ----------
+
+
+class ScheduleTaskIn(BaseModel):
+    no: str = Field(..., description="箱号，必须与方案中的箱项完全一致")
+    duration: int = Field(..., ge=1, description="每箱吊装时长（正整数，分钟）")
+    earliest_start: int = Field(..., ge=0, description="最早开工分钟（非负整数）")
+    latest_finish: int = Field(..., ge=0, description="最迟完工分钟（非负整数，允许恰在该时刻结束）")
+
+    @field_validator("no")
+    @classmethod
+    def _no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "箱号")
+
+    @model_validator(mode="after")
+    def _validate(self) -> "ScheduleTaskIn":
+        if self.earliest_start + self.duration > self.latest_finish:
+            raise ValueError(
+                f"箱 {self.no} 时间窗无解：最早开工 {self.earliest_start} + 吊装时长 "
+                f"{self.duration} > 最迟完工 {self.latest_finish}"
+            )
+        return self
+
+
+class ScheduleCreateIn(BaseModel):
+    cranes: int = Field(..., ge=1, description="岸桥数量（正整数）")
+    tasks: list[ScheduleTaskIn] = Field(
+        ..., description="每箱吊装时长与时间窗；箱项必须与方案完全一致（不缺不多）"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "ScheduleCreateIn":
+        nos = [t.no for t in self.tasks]
+        if len(set(nos)) != len(nos):
+            dup = sorted({n for n in nos if nos.count(n) > 1})
+            raise ValueError(f"排程箱号重复：{', '.join(dup)}")
+        return self
+
+
+class ScheduleItemOut(BaseModel):
+    container_no: str
+    stack: str
+    tier: int
+    start: int
+    finish: int
+    crane: int
+
+
+class ScheduleOut(BaseModel):
+    schedule_id: str
+    plan_id: str
+    status: str
+    cranes: int
+    makespan: int
+    root_id: str
+    plan_revision_no: int
+    slots_revision: int
+    manifest_revision: int
+    tasks: list[ScheduleItemOut]
+    created_at: str
